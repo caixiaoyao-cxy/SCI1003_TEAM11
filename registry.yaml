@@ -1,0 +1,129 @@
+tools:
+  - name: "samtools_flagstat"
+    type: "cli"
+    command: "samtools flagstat {bam_path}"
+    description: "Calculate alignment statistics from a BAM file."
+    output_control:
+      intercept_large_output: true
+      max_preview_lines: 50
+    inputs:
+      bam_path:
+        type: "string"
+        description: "Absolute path to the BAM file inside /data."
+
+  - name: "bedtools_intersect"
+    type: "cli"
+    command: "bedtools intersect -a {a_bed_path} -b {b_bed_path} -wa -wb"
+    description: "Intersect two BED files and return overlapping records."
+    output_control:
+      intercept_large_output: true
+      max_preview_lines: 100
+    inputs:
+      a_bed_path:
+        type: "string"
+        description: "Absolute path to the first BED file inside /data."
+      b_bed_path:
+        type: "string"
+        description: "Absolute path to the second BED file inside /data."
+
+  - name: "blastn_tabular"
+    type: "cli"
+    command: "blastn -query {query_fasta_path} -db {blast_db_path} -outfmt 6"
+    description: "Run BLASTN and return tabular outfmt 6 hits."
+    output_control:
+      intercept_large_output: true
+      max_preview_lines: 80
+    inputs:
+      query_fasta_path:
+        type: "string"
+        description: "Absolute path to the query FASTA file inside /data."
+      blast_db_path:
+        type: "string"
+        description: "Absolute path or BLAST database prefix inside /data."
+
+  - name: "fastp_qc"
+    type: "cli"
+    command: "fastp -i {fq_path} -o {filtered_fq_path} -h {html_report_path} -j {json_report_path} -R MCP_fastp_report"
+    description: "Run FASTQ quality control with fastp and produce HTML/JSON reports. Install fastp first if it is not present in the image."
+    output_control:
+      intercept_large_output: true
+      max_preview_lines: 30
+    inputs:
+      fq_path:
+        type: "string"
+        description: "Path to input FASTQ file inside /data."
+      filtered_fq_path:
+        type: "string"
+        description: "Target path for the filtered FASTQ output inside /data."
+      html_report_path:
+        type: "string"
+        description: "Target path for the fastp HTML report inside /data."
+      json_report_path:
+        type: "string"
+        description: "Target path for the fastp JSON report inside /data."
+    expected_outputs:
+      - name: "html_report_path"
+        render_as: "text"
+      - name: "json_report_path"
+        render_as: "text"
+
+  - name: "render_qc_png"
+    type: "script"
+    command: "python {script_path} {metrics_tsv_path} {png_output_path}"
+    description: "Run a user-provided Python plotting script that converts a metrics TSV into a PNG image."
+    output_control:
+      intercept_large_output: true
+      max_preview_lines: 40
+    inputs:
+      script_path:
+        type: "string"
+        description: "Path to a Python plotting script inside /data."
+      metrics_tsv_path:
+        type: "string"
+        description: "Path to a metrics TSV file inside /data."
+      png_output_path:
+        type: "string"
+        description: "Target path for the generated PNG image inside /data."
+    expected_outputs:
+      - name: "metrics_tsv_path"
+        render_as: "dataframe"
+        max_rows: 20
+      - name: "png_output_path"
+        render_as: "image"
+
+  - name: "extract_pdf_summary"
+    type: "script"
+    command: "python -c \"import sys; from pathlib import Path; print(Path(sys.argv[1]).name)\" {pdf_path}"
+    description: "Example PDF-aware tool entry; the server extracts the first three pages from the provided PDF output path."
+    output_control:
+      intercept_large_output: false
+      max_preview_lines: 50
+    inputs:
+      pdf_path:
+        type: "string"
+        description: "Path to a PDF file inside /data."
+    expected_outputs:
+      - name: "pdf_path"
+        render_as: "pdf"
+
+  - name: "picard_collect_alignment_summary"
+    type: "java"
+    command: "java -jar {picard_jar_path} CollectAlignmentSummaryMetrics I={bam_path} O={metrics_tsv_path}"
+    description: "Run Picard CollectAlignmentSummaryMetrics from a user-supplied JAR and render the metrics table."
+    output_control:
+      intercept_large_output: true
+      max_preview_lines: 60
+    inputs:
+      picard_jar_path:
+        type: "string"
+        description: "Path to picard.jar inside /data."
+      bam_path:
+        type: "string"
+        description: "Path to the input BAM file inside /data."
+      metrics_tsv_path:
+        type: "string"
+        description: "Target path for Picard metrics inside /data."
+    expected_outputs:
+      - name: "metrics_tsv_path"
+        render_as: "dataframe"
+        max_rows: 30

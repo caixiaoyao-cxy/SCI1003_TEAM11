@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+
+# Runtime data and agent-installed tools. Keep only directory placeholders.
+data/*
+!data/.gitkeep
+!data/mcp_outputs/
+!data/mcp_outputs/.gitkeep
+!data/mcp_tools/
+!data/mcp_tools/.gitkeep
+!data/mcp_tools/bin/
+!data/mcp_tools/bin/.gitkeep
+
+# App-side persisted state generated inside containers or local runs.
+storage/*
+!storage/.gitkeep

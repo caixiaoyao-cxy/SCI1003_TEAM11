@@ -14,12 +14,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import urllib.request
 import uuid
 import zipfile
 from pathlib import Path, PureWindowsPath
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import yaml
 from mcp.types import ImageContent, TextContent
@@ -39,6 +40,9 @@ USER_REGISTRY_PATH = Path(
 TOOL_BIN_ROOT = Path(os.environ.get("MCP_TOOL_BIN_ROOT", DATA_ROOT / "mcp_tools" / "bin")).resolve()
 TOOL_VENV_ROOT = Path(
     os.environ.get("MCP_TOOL_VENV_ROOT", DATA_ROOT / "mcp_tools" / "venvs")
+).resolve()
+TOOL_JAVA_ROOT = Path(
+    os.environ.get("MCP_TOOL_JAVA_ROOT", DATA_ROOT / "mcp_tools" / "java")
 ).resolve()
 STORAGE_ROOT = APP_ROOT / "storage"
 OUTPUT_ROOT = DATA_ROOT / "mcp_outputs"
@@ -62,10 +66,16 @@ logger = logging.getLogger("bio-mcp-server")
 mcp = FastMCP("secure-bioinformatics-platform")
 registry_cache: dict[str, dict[str, Any]] = {}
 registered_tool_names: set[str] = set()
+INSTALL_LOCK = threading.RLock()
+REGISTRY_LOCK = threading.RLock()
 
 
 class RegistryError(ValueError):
     """Raised when registry configuration is malformed."""
+
+
+class InstallConflictError(RuntimeError):
+    """Raised when a dynamic tool install would overwrite existing state."""
 
 
 def ensure_runtime_directories() -> None:
@@ -73,7 +83,17 @@ def ensure_runtime_directories() -> None:
         raise RuntimeError(f"MCP_TOOL_BIN_ROOT must resolve inside {DATA_ROOT}; got {TOOL_BIN_ROOT}")
     if not is_relative_to(TOOL_VENV_ROOT, DATA_ROOT):
         raise RuntimeError(f"MCP_TOOL_VENV_ROOT must resolve inside {DATA_ROOT}; got {TOOL_VENV_ROOT}")
-    for directory in (APP_ROOT, STORAGE_ROOT, DATA_ROOT, OUTPUT_ROOT, TOOL_BIN_ROOT, TOOL_VENV_ROOT):
+    if not is_relative_to(TOOL_JAVA_ROOT, DATA_ROOT):
+        raise RuntimeError(f"MCP_TOOL_JAVA_ROOT must resolve inside {DATA_ROOT}; got {TOOL_JAVA_ROOT}")
+    for directory in (
+        APP_ROOT,
+        STORAGE_ROOT,
+        DATA_ROOT,
+        OUTPUT_ROOT,
+        TOOL_BIN_ROOT,
+        TOOL_VENV_ROOT,
+        TOOL_JAVA_ROOT,
+    ):
         directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -630,6 +650,10 @@ def registry_snapshot() -> dict[str, Any]:
                     {
                         "name": entry.get("name"),
                         "type": entry.get("type"),
+                        "description": entry.get("description", ""),
+                        "command": entry.get("command", ""),
+                        "inputs": entry.get("inputs", {}),
+                        "expected_outputs": entry.get("expected_outputs", []),
                         "source": source,
                         "source_path": str(source_path),
                     }
@@ -640,6 +664,7 @@ def registry_snapshot() -> dict[str, Any]:
         "user_registry_path": str(USER_REGISTRY_PATH),
         "tool_bin_root": str(TOOL_BIN_ROOT),
         "tool_venv_root": str(TOOL_VENV_ROOT),
+        "tool_java_root": str(TOOL_JAVA_ROOT),
         "base_tool_count": len(base_tools),
         "user_tool_count": len(user_tools),
         "effective_tool_count": len(tools),
@@ -725,34 +750,240 @@ def validate_http_url(download_url: str) -> None:
 def write_python_tool_wrapper(wrapper_path: Path, target_binary: Path) -> None:
     wrapper = f"#!/bin/sh\nexec {shlex.quote(str(target_binary))} \"$@\"\n"
     atomic_write_text(wrapper_path, wrapper)
-    current_mode = wrapper_path.stat().st_mode
-    wrapper_path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    wrapper_path.chmod(0o755)
+
+
+def locate_executable_conflict(binary_name: str, install_path: Path) -> str | None:
+    existing = shutil.which(binary_name)
+    if not existing:
+        return None
+    existing_path = Path(existing).resolve(strict=False)
+    target_path = install_path.resolve(strict=False)
+    if existing_path == target_path:
+        return str(existing_path)
+    return str(existing_path)
+
+
+def reserve_executable_path(wrapper_path: Path) -> None:
+    wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    placeholder = (
+        "#!/bin/sh\n"
+        "printf '%s\\n' 'Tool installation did not complete; remove this wrapper and retry.' >&2\n"
+        "exit 126\n"
+    ).encode("utf-8")
+    try:
+        fd = os.open(str(wrapper_path), flags, 0o755)
+    except FileExistsError as exc:
+        raise InstallConflictError(
+            f"Tool wrapper already exists at {wrapper_path}; refusing to overwrite."
+        ) from exc
+    try:
+        os.write(fd, placeholder)
+    finally:
+        os.close(fd)
+    wrapper_path.chmod(0o755)
+
+
+def validate_jar_name(jar_name: str) -> str:
+    jar_name = jar_name.strip()
+    if not jar_name:
+        raise ValueError("jar_name must not be empty when provided.")
+    if Path(jar_name).name != jar_name or PureWindowsPath(jar_name).name != jar_name:
+        raise ValueError("jar_name must be a basename, not a path.")
+    if not jar_name.lower().endswith(".jar"):
+        raise ValueError("jar_name must end with .jar.")
+    return jar_name
+
+
+def direct_jar_filename(download_url: str) -> str | None:
+    file_name = unquote(Path(urlparse(download_url).path).name)
+    if not file_name.lower().endswith(".jar"):
+        return None
+    return validate_jar_name(file_name)
+
+
+def locate_main_jar(search_root: Path, jar_name: str = "") -> Path:
+    jars = sorted(
+        (
+            candidate
+            for candidate in search_root.rglob("*")
+            if candidate.is_file() and not candidate.is_symlink() and candidate.suffix.lower() == ".jar"
+        ),
+        key=lambda path: str(path.relative_to(search_root)),
+    )
+    if not jars:
+        raise FileNotFoundError("No .jar files found in downloaded artifact.")
+    if jar_name:
+        selected_name = validate_jar_name(jar_name)
+        matches = [candidate for candidate in jars if candidate.name == selected_name]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise FileNotFoundError(f"Unable to locate jar_name '{selected_name}' in downloaded artifact.")
+        raise ValueError(f"Multiple .jar files named '{selected_name}' found in downloaded artifact.")
+    if len(jars) == 1:
+        return jars[0]
+    found = ", ".join(str(path.relative_to(search_root)) for path in jars[:10])
+    if len(jars) > 10:
+        found = f"{found}, ..."
+    raise ValueError(f"Archive contains multiple .jar files; provide jar_name. Found: {found}")
+
+
+def shell_double_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+    return f'"{escaped}"'
+
+
+def write_java_tool_wrapper(wrapper_path: Path, jar_path: Path) -> None:
+    wrapper = f"#!/bin/sh\nexec java ${{JAVA_OPTS:-}} -jar {shell_double_quote(str(jar_path))} \"$@\"\n"
+    atomic_write_text(wrapper_path, wrapper)
+    wrapper_path.chmod(0o755)
+
+
+def write_java_tool_metadata(
+    metadata_path: Path,
+    *,
+    package_name: str,
+    download_url: str,
+    binary_name: str,
+    jar_path: Path,
+) -> None:
+    metadata = {
+        "package_name": package_name,
+        "download_url": download_url,
+        "binary_name": binary_name,
+        "jar_path": str(jar_path),
+    }
+    atomic_write_text(metadata_path, json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+
+def install_java_url_tool(package_name: str, download_url: str, binary_name: str, jar_name: str) -> str:
+    if not download_url:
+        return "download_url is required for method='java_url'."
+    if not SAFE_BINARY_RE.match(package_name) or package_name in {".", ".."}:
+        return f"Rejected unsafe package name: {package_name!r}"
+    if not SAFE_BINARY_RE.match(binary_name) or binary_name in {".", ".."}:
+        return f"Rejected unsafe binary name: {binary_name!r}"
+    if jar_name:
+        try:
+            jar_name = validate_jar_name(jar_name)
+        except ValueError as exc:
+            return f"Rejected unsafe jar_name: {exc}"
+
+    package_path = TOOL_JAVA_ROOT / package_name
+    wrapper_path = TOOL_BIN_ROOT / binary_name
+    package_created = False
+    wrapper_reserved = False
+    try:
+        validate_http_url(download_url)
+        if package_path.exists() or package_path.is_symlink():
+            raise InstallConflictError(
+                f"Java package directory already exists at {package_path}; refusing to overwrite."
+            )
+        if wrapper_path.exists() or wrapper_path.is_symlink():
+            raise InstallConflictError(
+                f"Tool wrapper already exists at {wrapper_path}; refusing to overwrite."
+            )
+        executable_conflict = locate_executable_conflict(binary_name, wrapper_path)
+        if executable_conflict:
+            raise InstallConflictError(
+                f"Tool wrapper name '{binary_name}' conflicts with existing executable "
+                f"at {executable_conflict}; choose a unique binary_name."
+            )
+
+        TOOL_BIN_ROOT.mkdir(parents=True, exist_ok=True)
+        TOOL_JAVA_ROOT.mkdir(parents=True, exist_ok=True)
+        try:
+            package_path.mkdir(parents=True, exist_ok=False)
+            package_created = True
+        except FileExistsError as exc:
+            raise InstallConflictError(
+                f"Java package directory already exists at {package_path}; refusing to overwrite."
+            ) from exc
+
+        try:
+            reserve_executable_path(wrapper_path)
+            wrapper_reserved = True
+            with tempfile.TemporaryDirectory(prefix="bio-tool-install-") as tmp:
+                tmp_root = Path(tmp)
+                artifact = tmp_root / "downloaded_artifact"
+                extracted = tmp_root / "extracted"
+                safe_download_to_temp(download_url, artifact)
+                jar_file_name = direct_jar_filename(download_url)
+                if jar_file_name:
+                    jar_path = package_path / jar_file_name
+                    shutil.copy2(artifact, jar_path)
+                else:
+                    extracted.mkdir()
+                    if tarfile.is_tarfile(artifact):
+                        safe_extract_tar(artifact, extracted)
+                    elif zipfile.is_zipfile(artifact):
+                        safe_extract_zip(artifact, extracted)
+                    else:
+                        raise ValueError(
+                            "download_url must point to a .jar, .zip, .tar, .tar.gz, or .tgz artifact."
+                        )
+                    source_jar = locate_main_jar(extracted, jar_name)
+                    jar_relative_path = source_jar.relative_to(extracted)
+                    shutil.copytree(extracted, package_path, dirs_exist_ok=True)
+                    jar_path = package_path / jar_relative_path
+            write_java_tool_wrapper(wrapper_path, jar_path)
+            write_java_tool_metadata(
+                package_path / "metadata.json",
+                package_name=package_name,
+                download_url=download_url,
+                binary_name=binary_name,
+                jar_path=jar_path,
+            )
+        except Exception:
+            if wrapper_reserved and (wrapper_path.exists() or wrapper_path.is_symlink()):
+                wrapper_path.unlink()
+            if package_created and package_path.exists() and not package_path.is_symlink():
+                shutil.rmtree(package_path)
+            raise
+        return (
+            f"Installed Java tool '{package_name}' from URL into {package_path}. "
+            f"Created wrapper '{binary_name}' at {wrapper_path}."
+        )
+    except InstallConflictError as exc:
+        return str(exc)
+    except Exception as exc:
+        logger.exception("java_url install failed for %s", package_name)
+        return f"java_url install failed for '{package_name}': {exc}"
 
 
 @mcp.tool()
-def install_bio_tool(method: str, package_name: str = "", download_url: str = "", binary_name: str = "") -> str:
-    """Install a bioinformatics tool using apt, a binary URL, or a Python package URL."""
+def install_bio_tool(
+    method: str,
+    package_name: str = "",
+    download_url: str = "",
+    binary_name: str = "",
+    jar_name: str = "",
+) -> str:
+    """Install a bioinformatics tool using apt, binary/Python URLs, or a Java JAR URL."""
     method = method.strip().lower()
 
     if method == "apt":
         if not APT_PACKAGE_RE.match(package_name):
             return f"Rejected unsafe apt package name: {package_name!r}"
-        try:
-            subprocess.run(["apt-get", "update"], check=True, capture_output=True, text=True)
-            completed = subprocess.run(
-                ["apt-get", "install", "-y", "--no-install-recommends", package_name],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            return f"Installed apt package '{package_name}'.\n{completed.stdout[-4000:]}"
-        except subprocess.CalledProcessError as exc:
-            logger.exception("apt install failed for %s", package_name)
-            return (
-                f"apt install failed for '{package_name}' with exit code {exc.returncode}.\n"
-                f"STDOUT:\n{exc.stdout[-4000:] if exc.stdout else ''}\n"
-                f"STDERR:\n{exc.stderr[-4000:] if exc.stderr else ''}"
-            )
+        with INSTALL_LOCK:
+            try:
+                subprocess.run(["apt-get", "update"], check=True, capture_output=True, text=True)
+                completed = subprocess.run(
+                    ["apt-get", "install", "-y", "--no-install-recommends", package_name],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return f"Installed apt package '{package_name}'.\n{completed.stdout[-4000:]}"
+            except subprocess.CalledProcessError as exc:
+                logger.exception("apt install failed for %s", package_name)
+                return (
+                    f"apt install failed for '{package_name}' with exit code {exc.returncode}.\n"
+                    f"STDOUT:\n{exc.stdout[-4000:] if exc.stdout else ''}\n"
+                    f"STDERR:\n{exc.stderr[-4000:] if exc.stderr else ''}"
+                )
 
     if method == "binary_url":
         if not download_url:
@@ -760,29 +991,34 @@ def install_bio_tool(method: str, package_name: str = "", download_url: str = ""
         if not SAFE_BINARY_RE.match(binary_name):
             return f"Rejected unsafe binary name: {binary_name!r}"
         install_path = TOOL_BIN_ROOT / binary_name
-        try:
-            TOOL_BIN_ROOT.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix="bio-tool-install-") as tmp:
-                tmp_root = Path(tmp)
-                artifact = tmp_root / "downloaded_artifact"
-                extracted = tmp_root / "extracted"
-                extracted.mkdir()
-                safe_download_to_temp(download_url, artifact)
-                if tarfile.is_tarfile(artifact):
-                    safe_extract_tar(artifact, extracted)
-                    source_binary = locate_binary(extracted, binary_name)
-                elif zipfile.is_zipfile(artifact):
-                    safe_extract_zip(artifact, extracted)
-                    source_binary = locate_binary(extracted, binary_name)
-                else:
-                    source_binary = artifact
-                shutil.copy2(source_binary, install_path)
-                current_mode = install_path.stat().st_mode
-                install_path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-            return f"Installed persistent binary '{binary_name}' at {install_path}."
-        except Exception as exc:
-            logger.exception("binary_url install failed for %s", binary_name)
-            return f"binary_url install failed for '{binary_name}': {exc}"
+        with INSTALL_LOCK:
+            try:
+                TOOL_BIN_ROOT.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix="bio-tool-install-") as tmp:
+                    tmp_root = Path(tmp)
+                    artifact = tmp_root / "downloaded_artifact"
+                    extracted = tmp_root / "extracted"
+                    extracted.mkdir()
+                    safe_download_to_temp(download_url, artifact)
+                    if tarfile.is_tarfile(artifact):
+                        safe_extract_tar(artifact, extracted)
+                        source_binary = locate_binary(extracted, binary_name)
+                    elif zipfile.is_zipfile(artifact):
+                        safe_extract_zip(artifact, extracted)
+                        source_binary = locate_binary(extracted, binary_name)
+                    else:
+                        source_binary = artifact
+                    shutil.copy2(source_binary, install_path)
+                    current_mode = install_path.stat().st_mode
+                    install_path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                return f"Installed persistent binary '{binary_name}' at {install_path}."
+            except Exception as exc:
+                logger.exception("binary_url install failed for %s", binary_name)
+                return f"binary_url install failed for '{binary_name}': {exc}"
+
+    if method == "java_url":
+        with INSTALL_LOCK:
+            return install_java_url_tool(package_name, download_url, binary_name, jar_name)
 
     if method == "pip_url":
         if not download_url:
@@ -793,109 +1029,113 @@ def install_bio_tool(method: str, package_name: str = "", download_url: str = ""
             return f"Rejected unsafe binary name: {binary_name!r}"
         venv_path = TOOL_VENV_ROOT / package_name
         wrapper_path = TOOL_BIN_ROOT / binary_name
-        try:
-            validate_http_url(download_url)
-            TOOL_BIN_ROOT.mkdir(parents=True, exist_ok=True)
-            TOOL_VENV_ROOT.mkdir(parents=True, exist_ok=True)
-            if venv_path.exists():
-                shutil.rmtree(venv_path)
-            subprocess.run(
-                [sys.executable, "-m", "venv", str(venv_path)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            python_path = venv_path / "bin" / "python"
-            binary_path = venv_path / "bin" / binary_name
-            subprocess.run(
-                [str(python_path), "-m", "pip", "install", download_url],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            if not binary_path.is_file():
-                raise FileNotFoundError(
-                    f"Unable to locate installed CLI '{binary_name}' at {binary_path}."
+        with INSTALL_LOCK:
+            try:
+                validate_http_url(download_url)
+                TOOL_BIN_ROOT.mkdir(parents=True, exist_ok=True)
+                TOOL_VENV_ROOT.mkdir(parents=True, exist_ok=True)
+                if venv_path.exists():
+                    shutil.rmtree(venv_path)
+                subprocess.run(
+                    [sys.executable, "-m", "venv", str(venv_path)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
                 )
-            write_python_tool_wrapper(wrapper_path, binary_path)
-            return (
-                f"Installed Python package '{package_name}' from URL into {venv_path}. "
-                f"Created wrapper '{binary_name}' at {wrapper_path}."
-            )
-        except subprocess.CalledProcessError as exc:
-            logger.exception("pip_url install failed for %s", package_name)
-            return (
-                f"pip_url install failed for '{package_name}' with exit code {exc.returncode}.\n"
-                f"STDOUT:\n{exc.stdout[-4000:] if exc.stdout else ''}\n"
-                f"STDERR:\n{exc.stderr[-4000:] if exc.stderr else ''}"
-            )
-        except Exception as exc:
-            logger.exception("pip_url install failed for %s", package_name)
-            return f"pip_url install failed for '{package_name}': {exc}"
+                python_path = venv_path / "bin" / "python"
+                binary_path = venv_path / "bin" / binary_name
+                subprocess.run(
+                    [str(python_path), "-m", "pip", "install", download_url],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                if not binary_path.is_file():
+                    raise FileNotFoundError(
+                        f"Unable to locate installed CLI '{binary_name}' at {binary_path}."
+                    )
+                write_python_tool_wrapper(wrapper_path, binary_path)
+                return (
+                    f"Installed Python package '{package_name}' from URL into {venv_path}. "
+                    f"Created wrapper '{binary_name}' at {wrapper_path}."
+                )
+            except subprocess.CalledProcessError as exc:
+                logger.exception("pip_url install failed for %s", package_name)
+                return (
+                    f"pip_url install failed for '{package_name}' with exit code {exc.returncode}.\n"
+                    f"STDOUT:\n{exc.stdout[-4000:] if exc.stdout else ''}\n"
+                    f"STDERR:\n{exc.stderr[-4000:] if exc.stderr else ''}"
+                )
+            except Exception as exc:
+                logger.exception("pip_url install failed for %s", package_name)
+                return f"pip_url install failed for '{package_name}': {exc}"
 
-    return "Unsupported method. Use method='apt', method='binary_url', or method='pip_url'."
+    return "Unsupported method. Use method='apt', method='binary_url', method='pip_url', or method='java_url'."
 
 
 @mcp.tool()
 def append_tool_to_registry(new_tool_yaml_str: str) -> str:
-    """Append a single tool YAML schema to the persistent user registry and hot-register it."""
-    try:
-        new_tool = extract_single_tool_from_yaml(new_tool_yaml_str)
-        effective_registry = load_effective_registry()
-        existing_tools = effective_registry.get("tools", [])
-        if not isinstance(existing_tools, list):
-            raise RegistryError("Effective registry key 'tools' is not a list.")
-        existing_names = {tool.get("name") for tool in existing_tools if isinstance(tool, dict)}
-        if new_tool["name"] in existing_names:
-            raise RegistryError(f"Tool '{new_tool['name']}' already exists in registry.")
+    """Append one validated tool YAML schema to the persistent user registry and hot-register it."""
+    with REGISTRY_LOCK:
+        try:
+            new_tool = extract_single_tool_from_yaml(new_tool_yaml_str)
+            effective_registry = load_effective_registry()
+            existing_tools = effective_registry.get("tools", [])
+            if not isinstance(existing_tools, list):
+                raise RegistryError("Effective registry key 'tools' is not a list.")
+            existing_names = {tool.get("name") for tool in existing_tools if isinstance(tool, dict)}
+            if new_tool["name"] in existing_names:
+                raise RegistryError(f"Tool '{new_tool['name']}' already exists in registry.")
 
-        user_registry = load_user_registry_file()
-        tools = user_registry.setdefault("tools", [])
-        if not isinstance(tools, list):
-            raise RegistryError("User registry key 'tools' is not a list.")
+            user_registry = load_user_registry_file()
+            tools = user_registry.setdefault("tools", [])
+            if not isinstance(tools, list):
+                raise RegistryError("User registry key 'tools' is not a list.")
 
-        tools.append(new_tool)
-        rendered = yaml.safe_dump(user_registry, sort_keys=False, allow_unicode=False)
-        atomic_write_text(USER_REGISTRY_PATH, rendered)
-        load_and_register_registry()
-        return (
-            f"Appended and hot-registered tool '{new_tool['name']}'. "
-            f"Persisted at {USER_REGISTRY_PATH}."
-        )
-    except Exception as exc:
-        logger.exception("Failed appending tool to registry")
-        return f"Failed to append tool: {exc}"
+            tools.append(new_tool)
+            rendered = yaml.safe_dump(user_registry, sort_keys=False, allow_unicode=False)
+            atomic_write_text(USER_REGISTRY_PATH, rendered)
+            load_and_register_registry()
+            return (
+                f"Appended and hot-registered tool '{new_tool['name']}'. "
+                f"Persisted at {USER_REGISTRY_PATH}."
+            )
+        except Exception as exc:
+            logger.exception("Failed appending tool to registry")
+            return f"Failed to append tool: {exc}"
 
 
 @mcp.tool()
 def list_registered_tools() -> str:
-    """List the effective registry and runtime-registered tool names."""
-    try:
-        return json.dumps(registry_snapshot(), indent=2)
-    except Exception as exc:
-        logger.exception("Failed listing registered tools")
-        return f"Failed to list registered tools: {exc}"
+    """List registered tools with names, commands, descriptions, inputs, sources, and runtime state."""
+    with REGISTRY_LOCK:
+        try:
+            return json.dumps(registry_snapshot(), indent=2)
+        except Exception as exc:
+            logger.exception("Failed listing registered tools")
+            return f"Failed to list registered tools: {exc}"
 
 
 @mcp.tool()
 def reload_registry() -> str:
     """Reload base and user registries into the running MCP server."""
-    try:
-        newly_registered = load_and_register_registry()
-        snapshot = registry_snapshot()
-        return json.dumps(
-            {
-                "status": "ok",
-                "newly_registered": newly_registered,
-                "effective_tool_count": snapshot["effective_tool_count"],
-                "runtime_registered_tool_count": snapshot["runtime_registered_tool_count"],
-                "runtime_registered_tools": snapshot["runtime_registered_tools"],
-            },
-            indent=2,
-        )
-    except Exception as exc:
-        logger.exception("Failed reloading registry")
-        return f"Failed to reload registry: {exc}"
+    with REGISTRY_LOCK:
+        try:
+            newly_registered = load_and_register_registry()
+            snapshot = registry_snapshot()
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "newly_registered": newly_registered,
+                    "effective_tool_count": snapshot["effective_tool_count"],
+                    "runtime_registered_tool_count": snapshot["runtime_registered_tool_count"],
+                    "runtime_registered_tools": snapshot["runtime_registered_tools"],
+                },
+                indent=2,
+            )
+        except Exception as exc:
+            logger.exception("Failed reloading registry")
+            return f"Failed to reload registry: {exc}"
 
 
 def main() -> None:

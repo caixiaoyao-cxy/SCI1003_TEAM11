@@ -11,11 +11,13 @@ images, Markdown data tables, and PDF text summaries as MCP content.
 
 ## Features
 
-- No Bioconda: uses `python:3.11-slim-bookworm`, apt packages, and pip wheels.
+- No Bioconda: uses `python:3.11-slim-bookworm`, apt packages, and `uv` for
+  Python dependencies.
 - Dynamic registry: built-in tools are loaded from `/app/registry.yaml`.
 - Persistent user tools: agent-added tools are stored in `/data/mcp_registry.yaml`.
 - Persistent downloaded tools: `binary_url` installs to `/data/mcp_tools/bin`;
-  `pip_url` installs Python CLIs into `/data/mcp_tools/venvs`.
+  `pip_url` installs Python CLIs into `/data/mcp_tools/venvs`; `java_url`
+  installs JAR tools into `/data/mcp_tools/java`.
 - Secure execution: commands are split with `shlex.split`; `shell=True` is not used.
 - Data firewall: path inputs must resolve inside `/data`.
 - Large-output interception: full raw output is written to `/data/mcp_outputs`.
@@ -161,6 +163,7 @@ args = ["run", "--rm", "-i", "-v", "E:\\bio-data:/data", "bio-mcp"]
 /data/
   mcp_registry.yaml       # Agent-added persistent tool schemas
   mcp_tools/bin/          # Persistent binaries and CLI wrappers
+  mcp_tools/java/         # Per-tool Java JAR/release package directories
   mcp_tools/venvs/        # Persistent Python virtualenvs installed by pip_url
   mcp_outputs/            # Full raw outputs intercepted by the data firewall
   your_input_files...     # FASTA, FASTQ, BAM, BED, PDF, TSV, etc.
@@ -183,7 +186,8 @@ Parameters:
   "method": "binary_url",
   "package_name": "seqkit",
   "download_url": "https://github.com/shenwei356/seqkit/releases/download/v2.13.0/seqkit_linux_amd64.tar.gz",
-  "binary_name": "seqkit"
+  "binary_name": "seqkit",
+  "jar_name": ""
 }
 ```
 
@@ -197,6 +201,16 @@ Supported methods:
 - `pip_url`: installs a Python source archive, wheel, or package URL into
   `/data/mcp_tools/venvs/<package_name>` and writes a wrapper named
   `binary_name` under `/data/mcp_tools/bin`.
+- `java_url`: downloads a direct `.jar` or a `.zip`/`.tar`/`.tar.gz`/`.tgz`
+  release package into `/data/mcp_tools/java/<package_name>`, selects the main
+  JAR, and writes a wrapper named `binary_name` under `/data/mcp_tools/bin`.
+  If an archive contains more than one JAR, provide `jar_name` as the basename
+  of the main JAR.
+
+`java_url` refuses to overwrite an existing Java package directory or existing
+tool wrapper. To upgrade a Java tool, remove the old
+`/data/mcp_tools/java/<package_name>` directory and `/data/mcp_tools/bin/<binary_name>`
+wrapper first, or install with new names.
 
 Example: install the `gget` CLI from a tagged GitHub source archive. This does
 not preinstall `gget` in the image; it installs it into the mounted `/data`
@@ -210,6 +224,38 @@ directory for this server.
   "binary_name": "gget"
 }
 ```
+
+Example: install a direct JAR and expose it as `picard`.
+
+```json
+{
+  "method": "java_url",
+  "package_name": "picard",
+  "download_url": "https://github.com/broadinstitute/picard/releases/download/3.4.0/picard.jar",
+  "binary_name": "picard"
+}
+```
+
+Example: install a release archive that contains multiple JARs.
+
+```json
+{
+  "method": "java_url",
+  "package_name": "example_java_tool",
+  "download_url": "https://example.org/releases/example_java_tool.tar.gz",
+  "binary_name": "example-java-tool",
+  "jar_name": "example-java-tool.jar"
+}
+```
+
+The generated wrapper uses the image's shared system JRE:
+
+```sh
+exec java ${JAVA_OPTS:-} -jar "/data/mcp_tools/java/<package_name>/.../<main>.jar" "$@"
+```
+
+Set JVM options in the runtime environment when needed, for example
+`JAVA_OPTS="-Xmx4g"`.
 
 ### `append_tool_to_registry`
 
@@ -233,12 +279,27 @@ inputs:
 ```
 
 Because `/data/mcp_tools/bin` is prepended to `PATH`, commands can refer to
-`seqkit` directly instead of using `/data/mcp_tools/bin/seqkit`.
+installed wrappers directly instead of using absolute paths. For Java tools,
+register the wrapper command the same way:
+
+```yaml
+name: picard_collect_alignment_summary_metrics
+type: cli
+command: "picard CollectAlignmentSummaryMetrics I={bam_path} O={metrics_tsv_path}"
+description: "Run Picard CollectAlignmentSummaryMetrics."
+inputs:
+  bam_path:
+    type: string
+    description: "Path to BAM file inside /data."
+  metrics_tsv_path:
+    type: string
+    description: "Output metrics path inside /data."
+```
 
 ### Registry Refresh Helpers
 
-- `list_registered_tools`: returns the merged registry, tool counts, sources,
-  and runtime-registered tool names.
+- `list_registered_tools`: returns the merged registry, tool counts, commands,
+  descriptions, inputs, sources, and runtime-registered tool names.
 - `reload_registry`: reloads `/app/registry.yaml` and `/data/mcp_registry.yaml`
   into the running server. This is useful after manually editing
   `/data/mcp_registry.yaml`.
@@ -268,6 +329,10 @@ tools:
       - name: output_path
         render_as: dataframe
 ```
+
+Use descriptions that help an agent choose correctly: name the underlying
+program or wrapper, the biological task, the expected inputs, and the main
+output.
 
 Supported `type` values:
 
